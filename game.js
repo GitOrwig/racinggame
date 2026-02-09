@@ -4,6 +4,26 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 
+// Shared geometry for smoke particles (Bug 6 fix: avoid allocating per particle)
+const SMOKE_GEOMETRY = new THREE.SphereGeometry(0.3, 4, 4);
+
+// Recursive dispose helper for GPU resource cleanup (Bug 7 fix)
+function disposeObject(obj) {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) {
+        if (Array.isArray(obj.material)) {
+            obj.material.forEach(m => m.dispose());
+        } else {
+            obj.material.dispose();
+        }
+    }
+    if (obj.children) {
+        for (const child of obj.children) {
+            disposeObject(child);
+        }
+    }
+}
+
 // ============================================================
 // CONFIGURATION
 // ============================================================
@@ -394,6 +414,7 @@ class CarBuilder {
 
         wheelPositions.forEach((pos, i) => {
             const wheelGroup = new THREE.Group();
+            wheelGroup.userData.isWheel = true;
 
             // Tire
             const tireGeo = new THREE.TorusGeometry(0.28, 0.12, 12, 24);
@@ -1138,10 +1159,13 @@ class CarPhysics {
         const prevT = this.trackT;
         this.trackT = bestT;
 
-        // Lap detection
-        if (prevT > 0.9 && this.trackT < 0.1) {
+        // Only count laps after car has moved a meaningful distance (Bug 5 fix)
+        if (this.totalDistance < 10) return;
+
+        // Lap detection (Bug 10 fix: require speed to prevent physics glitch false laps)
+        if (prevT > 0.9 && this.trackT < 0.1 && this.speed > 1) {
             this.lap++;
-        } else if (prevT < 0.1 && this.trackT > 0.9) {
+        } else if (prevT < 0.1 && this.trackT > 0.9 && this.speed < -1) {
             this.lap = Math.max(0, this.lap - 1);
         }
     }
@@ -1304,7 +1328,7 @@ class AudioEngine {
             this.engineOsc3.start();
 
             // Wind noise
-            const bufferSize = 2 * this.ctx.sampleRate;
+            const bufferSize = Math.ceil(this.ctx.sampleRate * 0.5);
             const noiseBuffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
             const data = noiseBuffer.getChannelData(0);
             for (let i = 0; i < bufferSize; i++) {
@@ -1402,7 +1426,7 @@ class HUDRenderer {
 
         // Gear
         const gearText = player.gear === 0 ? 'N' : player.gear.toString();
-        document.querySelector('.speed-gear').textContent = gearText;
+        document.getElementById('speed-gear').textContent = gearText;
 
         // Position
         const positions = this.calculatePositions(allPhysics);
@@ -1825,9 +1849,13 @@ class Game {
     }
 
     resetCars() {
-        // Remove old cars and rebuild with selected type
+        // Remove old cars and rebuild with selected type (Bug 7 fix: dispose GPU resources)
+        disposeObject(this.playerCar);
         this.scene.remove(this.playerCar);
-        for (const car of this.aiCars) this.scene.remove(car);
+        for (const car of this.aiCars) {
+            disposeObject(car);
+            this.scene.remove(car);
+        }
 
         this.createCars();
 
@@ -1835,11 +1863,11 @@ class Game {
         const gridSpacing = 0.008; // Spacing along track
         const stagger = 0.003;
 
-        this.playerPhysics.reset(0.995);
+        this.playerPhysics.reset(0.98);
         for (let i = 0; i < this.aiPhysics.length; i++) {
             const row = Math.floor(i / 2);
             const col = i % 2;
-            let t = 0.995 - (row + 1) * gridSpacing - col * stagger;
+            let t = 0.98 - (row + 1) * gridSpacing - col * stagger;
             t = ((t % 1) + 1) % 1;
             this.aiPhysics[i].reset(t);
 
@@ -1939,14 +1967,13 @@ class Game {
     }
 
     updateCarMesh(car, physics) {
-        car.position.set(physics.position.x, physics.position.y || 0.3, physics.position.z);
+        car.position.set(physics.position.x, physics.position.y ?? 0.3, physics.position.z);
         car.rotation.y = physics.rotation + Math.PI;
 
         // Wheel rotation
         const wheelSpeed = physics.speed * 5;
         car.children.forEach(child => {
-            if (child.children && child.children.length > 3 && child.position.y < 0.5) {
-                // This is a wheel group
+            if (child.userData.isWheel) {
                 child.children[0].rotation.z += wheelSpeed * 0.016; // Tire rotation
                 if (child.userData.isFrontWheel) {
                     child.rotation.z = physics.wheelAngle * 0.5;
@@ -2014,6 +2041,7 @@ class Game {
         if (this.sun) {
             this.sun.target.position.copy(carPos);
             this.sun.position.set(carPos.x + 100, 80, carPos.z + 50);
+            this.sun.target.updateMatrixWorld();
         }
     }
 
@@ -2021,13 +2049,12 @@ class Game {
         if (!physics.isDrifting && !physics.handbrake) return;
         if (Math.random() > 0.3) return;
 
-        const geo = new THREE.SphereGeometry(0.3, 4, 4);
         const mat = new THREE.MeshBasicMaterial({
             color: 0xcccccc,
             transparent: true,
             opacity: 0.4,
         });
-        const smoke = new THREE.Mesh(geo, mat);
+        const smoke = new THREE.Mesh(SMOKE_GEOMETRY, mat);
         smoke.position.copy(physics.position);
         smoke.position.y = 0.2;
         smoke.userData.life = 1.0;
@@ -2046,11 +2073,11 @@ class Game {
             p.userData.life -= dt * 1.5;
             p.position.add(p.userData.vel.clone().multiplyScalar(dt));
             p.scale.multiplyScalar(1 + dt * 2);
+            if (p.scale.x > 3) p.scale.setScalar(3);
             p.material.opacity = p.userData.life * 0.3;
 
             if (p.userData.life <= 0) {
                 this.scene.remove(p);
-                p.geometry.dispose();
                 p.material.dispose();
                 this.particleSystems.splice(i, 1);
             }
